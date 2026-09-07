@@ -1,11 +1,9 @@
+use crate::platform::ceil;
 pub use crate::unicode::CharacterData;
 
 use crate::unicode::{read_utf8, LinebreakData, Linebreaker, LINEBREAK_NONE};
 use crate::Font;
-use crate::{
-    platform::{ceil, floor},
-    Metrics,
-};
+use crate::{platform::floor, Metrics};
 use alloc::vec::*;
 use core::borrow::Borrow;
 use core::hash::{Hash, Hasher};
@@ -148,6 +146,11 @@ pub struct GlyphPosition<U: Copy + Clone = ()> {
     /// represents the top side of the glyph. This is like this so that (y + height) always produces
     /// the other bound for the glyph.
     pub y: f32,
+    /// X is in pixels, this value is the amount that was discarded for x to be floored to pixels.
+    pub x_discarded: f32,
+    /// Y is in pixels, this value is the amount that was discarded for y to be floored to pixels.
+    pub y_discarded: f32,
+    // pub metrics: Metrics,
     /// The width of the glyph. Dimensions are in pixels.
     pub width: usize,
     /// The height of the glyph. Dimensions are in pixels.
@@ -157,6 +160,8 @@ pub struct GlyphPosition<U: Copy + Clone = ()> {
     pub byte_offset: usize,
     /// Additional metadata associated with the character used to generate this glyph.
     pub char_data: CharacterData,
+    /// Is this an emoji glyph?
+    pub is_emoji: bool,
     /// Custom user data associated with the text styled used to generate this glyph.
     pub user_data: U,
 }
@@ -255,6 +260,10 @@ pub struct Layout<U: Copy + Clone = ()> {
     wrap_mask: LinebreakData,
     /// The max width of the region text is being laid out in.
     max_width: f32,
+    /// A max width value that is meant to override the "default" max_width, if present.
+    /// This is intended for when we want a particular line to linebreak based on a temporary
+    /// max width instead within a layout pass.
+    override_max_width: Option<f32>,
     /// The max height of the region text is being laid out in.
     max_height: f32,
     /// A multiplier for how text fills unused vertical space.
@@ -313,6 +322,7 @@ impl<'a, U: Copy + Clone> Layout<U> {
             y: 0.0,
             wrap_mask: LINEBREAK_NONE,
             max_width: 0.0,
+            override_max_width: None,
             max_height: 0.0,
             vertical_align: 0.0,
             horizontal_align: 0.0,
@@ -335,6 +345,12 @@ impl<'a, U: Copy + Clone> Layout<U> {
         };
         layout.reset(&settings);
         layout
+    }
+
+    /// Helper functions to introduce a slightly hacky workaround to allow
+    /// for proper text wrapping when text is indented.
+    pub fn set_override_max_width(&mut self, width: Option<f32>) {
+        self.override_max_width = width;
     }
 
     /// Resets the current layout settings and clears all appended text.
@@ -417,7 +433,13 @@ impl<'a, U: Copy + Clone> Layout<U> {
     /// Characters from the input string can only be omitted from the output, they are never
     /// reordered. The output buffer will always contain characters in the order they were defined
     /// in the styles.
-    pub fn append<T: Borrow<Font>>(&mut self, fonts: &[T], style: &TextStyle<U>) {
+    pub fn append<T: Borrow<Font>>(
+        &mut self,
+        fonts: &[T],
+        style: &TextStyle<U>,
+        emoji_byte_offsets: &[usize],
+        emoji_width_factor: f32,
+    ) {
         // The first layout pass requires some text.
         if style.text.is_empty() {
             return;
@@ -447,10 +469,49 @@ impl<'a, U: Copy + Clone> Layout<U> {
         }
 
         let mut byte_offset = 0;
+
+        let mut next_emoji_byte_offset = emoji_byte_offsets.get(0);
+        let mut next_emoji_byte_offset_i = 1;
+
+        let override_max_width = self.override_max_width.take().unwrap_or(self.max_width);
         while byte_offset < style.text.len() {
             let prev_byte_offset = byte_offset;
+
+            let is_emoji = Some(&byte_offset) == next_emoji_byte_offset;
+            if is_emoji {
+                next_emoji_byte_offset = emoji_byte_offsets.get(next_emoji_byte_offset_i);
+                next_emoji_byte_offset_i += 1;
+            }
+
             let character = read_utf8(style.text.as_bytes(), &mut byte_offset);
-            let linebreak = self.linebreaker.next(character).mask(self.wrap_mask);
+
+            // There is a problem where if a line starts on a space, it will treat it
+            // as a word wrap point, which in some cases makes the wrapped line not fit.
+            //
+            // Consider the case of this text:  |' dw'|. The line breaker will consider
+            // that first ' ' a valid point to wrap the line if the box shrinks. However,
+            // when the box shrinks, this is what happens:
+            // |' '|
+            // |'dw'
+            // And since the 'dw' is wider than ' ', the 'dw' will poke out of the box.
+            // The general violated rule is that if something is line-broke to a new line,
+            // that something should never be wider than the width of the line that caused it
+            // to line-break because then it might poke out. So, we clearly don't want a single
+            // ' ' at the start of the line to be a valid line break point.
+            //
+            // To fix this, we detect if the line starts on a ' ' and if it does, we don't send
+            // ' ' to the line breaker, but we instead send a non-whitespace character like 'm'
+            // so that it doesn't treat it as a valid line break point.
+            let problematic_space = self.linebreak_pos == 0.0 && character == ' ';
+
+            let linebreak = self
+                .linebreaker
+                .next(if problematic_space {
+                    'm'
+                } else {
+                    character
+                })
+                .mask(self.wrap_mask);
             let glyph_index = font.lookup_glyph_index(character);
             let char_data = CharacterData::classify(character, glyph_index);
             let metrics = if !char_data.is_control() {
@@ -458,7 +519,14 @@ impl<'a, U: Copy + Clone> Layout<U> {
             } else {
                 Metrics::default()
             };
-            let advance = ceil(metrics.advance_width);
+
+            let advance_whole = if is_emoji {
+                emoji_width_factor * style.px
+            } else {
+                metrics.advance_width
+            };
+
+            let advance = advance_whole;
 
             if linebreak >= self.linebreak_prev {
                 self.linebreak_prev = linebreak;
@@ -467,11 +535,17 @@ impl<'a, U: Copy + Clone> Layout<U> {
             }
 
             // Perform a linebreak
-            if linebreak.is_hard() || (self.current_pos - self.start_pos + advance > self.max_width) {
+            if linebreak.is_hard() || (self.current_pos - self.start_pos + advance > override_max_width) {
                 self.linebreak_prev = LINEBREAK_NONE;
                 let mut next_glyph_start = self.glyphs().len();
                 if let Some(line) = self.line_metrics.last_mut() {
                     line.glyph_end = self.linebreak_idx;
+
+                    // Notice that the padding for the current line is not override_max_width
+                    // This is to avoid changes to the max width on the new line we want to create
+                    // affecting padding on the previous (current) line
+                    // i.e when nesting indentations on a line, using override_max_width will
+                    // cause the previous line to shift as well
                     line.padding = self.max_width - (self.linebreak_pos - self.start_pos);
                     self.height += line.max_new_line_size * self.line_height;
                     next_glyph_start = self.linebreak_idx + 1;
@@ -490,10 +564,23 @@ impl<'a, U: Copy + Clone> Layout<U> {
                 self.start_pos = self.linebreak_pos;
             }
 
-            let y = if self.flip {
-                floor(-metrics.bounds.height - metrics.bounds.ymin) // PositiveYDown
+            let (y, y_discarded) = if self.flip {
+                let v = -metrics.bounds.height - metrics.bounds.ymin; // PositiveYDown
+                let fl = floor(v);
+                let discarded = v - fl;
+                (fl, discarded)
             } else {
-                floor(metrics.bounds.ymin) // PositiveYUp
+                let v = metrics.bounds.ymin; // PositiveYUp
+                let fl = floor(v);
+                let discarded = v - fl;
+                (fl, discarded)
+            };
+
+            let (x, x_discarded) = {
+                let v = self.current_pos + metrics.bounds.xmin;
+                let fl = floor(v);
+                let discarded = v - fl;
+                (fl, discarded)
             };
 
             self.glyphs.push(GlyphPosition {
@@ -505,18 +592,21 @@ impl<'a, U: Copy + Clone> Layout<U> {
                 font_index: style.font_index,
                 parent: character,
                 byte_offset: prev_byte_offset,
-                x: floor(self.current_pos + metrics.bounds.xmin),
+                x,
                 y,
+                x_discarded,
+                y_discarded,
                 width: metrics.width,
                 height: metrics.height,
                 char_data,
+                is_emoji,
                 user_data: style.user_data,
             });
             self.current_pos += advance;
         }
 
         if let Some(line) = self.line_metrics.last_mut() {
-            line.padding = self.max_width - (self.current_pos - self.start_pos);
+            line.padding = override_max_width - (self.current_pos - self.start_pos);
             line.glyph_end = self.glyphs.len().saturating_sub(1);
         }
 
